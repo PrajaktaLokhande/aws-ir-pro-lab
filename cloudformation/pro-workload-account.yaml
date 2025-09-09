@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Workload Account stack (demo VPC/ALB/ASG + GuardDuty/SecHub/Inspector + findings forward + remediation runbooks).
+
+Parameters:
+  SecurityAccountId:
+    Type: String
+    Description: Security account ID (12 digits)
+  SecurityEventBusArn:
+    Type: String
+    Description: Central EventBridge Bus ARN from Security stack
+  CreateDemoApp:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true','false']
+  EnableMacie:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+
+Resources:
+  # --- Networking + Demo app (optional) ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: MakeApp
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: prolab-vpc }]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Condition: MakeApp
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: MakeApp
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  PubSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: MakeApp
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PubSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: MakeApp
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  Rt:
+    Type: AWS::EC2::RouteTable
+    Condition: MakeApp
+    Properties: { VpcId: !Ref VPC }
+  RtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: MakeApp
+    Properties: { SubnetId: !Ref PubSubnetA, RouteTableId: !Ref Rt }
+  RtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: MakeApp
+    Properties: { SubnetId: !Ref PubSubnetB, RouteTableId: !Ref Rt }
+  RtDef:
+    Type: AWS::EC2::Route
+    Condition: MakeApp
+    Properties: { RouteTableId: !Ref Rt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW }
+
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Condition: MakeApp
+    Properties:
+      GroupDescription: ALB SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+
+  EC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Condition: MakeApp
+    Properties:
+      GroupDescription: EC2 SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ALBSG }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: MakeApp
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: t3.micro
+        SecurityGroupIds: [ !Ref EC2SG ]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf -y install httpd
+            echo "<h1>Hello from ASG instance</h1>" > /var/www/html/index.html
+            systemctl enable --now httpd
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Condition: MakeApp
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: MakeApp
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: MakeApp
+    Properties:
+      Type: application
+      Subnets: [ !Ref PubSubnetA, !Ref PubSubnetB ]
+      SecurityGroups: [ !Ref ALBSG ]
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: MakeApp
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TG
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: MakeApp
+    Properties:
+      VPCZoneIdentifier: [ !Ref PubSubnetA, !Ref PubSubnetB ]
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      TargetGroupARNs: [ !Ref TG ]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+  # --- Security services enablement ---
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties: { Enable: true }
+
+  SecurityHubEnable:
+    Type: AWS::SecurityHub::Hub
+    Properties: {}
+
+  SecurityHubStandardsCIS:
+    Type: AWS::SecurityHub::StandardsSubscription
+    Properties:
+      StandardsArn: !Sub arn:${AWS::Partition}:securityhub:${AWS::Region}::standards/cis-aws-foundations-benchmark/v/1.4.0
+
+  SecurityHubStandardsFSBP:
+    Type: AWS::SecurityHub::StandardsSubscription
+    Properties:
+      StandardsArn: !Sub arn:${AWS::Partition}:securityhub:${AWS::Region}::standards/aws-foundational-security-best-practices/v/1.0.0
+
+  Inspector2Enable:
+    Type: AWS::InspectorV2::Filter
+    Properties:
+      Name: prolab-placeholder-filter
+      FilterCriteria: {}
+
+  MacieSession:
+    Type: AWS::Macie::Session
+    Condition: UseMacie
+    Properties:
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Status: ENABLED
+
+  # --- EventBridge: forward to central bus & remediate locally ---
+  ToCentralBus:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Forward key findings to central bus
+      EventPattern:
+        source:
+          - aws.securityhub
+          - aws.guardduty
+      Targets:
+        - Arn: !Ref SecurityEventBusArn
+          Id: to-central
+
+  # Example remediation: quarantine EC2 on high-sev GuardDuty
+  QuarantineFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QuarantinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSecurityGroup
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+
+  QuarantineFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QuarantineFnRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3, json, os
+          ec2=boto3.client('ec2')
+          def ensure_quarantine_sg(vpc_id):
+              res=ec2.describe_security_groups(Filters=[{'Name':'group-name','Values':['prolab-quarantine']},{'Name':'vpc-id','Values':[vpc_id]}]).get('SecurityGroups',[])
+              if res: return res[0]['GroupId']
+              sg=ec2.create_security_group(GroupName='prolab-quarantine',Description='Egress/ingress blocked',VpcId=vpc_id)
+              # No ingress; no egress => default deny
+              return sg['GroupId']
+          def handler(event, ctx):
+              # Expect Security Hub or GuardDuty finding with instance id and vpc
+              detail = event.get('detail',{})
+              inst = None; vpc=None
+              # Try common shapes
+              r = detail.get('resource',{}) or detail.get('resources',{})
+              if isinstance(r, dict):
+                  inst = r.get('instanceDetails',{}).get('instanceId')
+                  vpc = r.get('instanceDetails',{}).get('networkInterfaces',[{}])[0].get('vpcId')
+              # Fallback: SecurityHub finding format
+              for res in detail.get('findings',[{}])[0].get('Resources',[]):
+                  if res.get('Type')=='AwsEc2Instance':
+                      inst=res.get('Id','').split('/')[-1]
+                      vpc=res.get('Details',{}).get('AwsEc2Instance',{}).get('VpcId')
+              if not inst or not vpc: return {'skipped':True,'reason':'no instance/vpc'}
+              qsg=ensure_quarantine_sg(vpc)
+              ec2.modify_instance_attribute(InstanceId=inst, Groups=[qsg])
+              return {'quarantined':inst,'sg':qsg}
+
+  QuarantineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Quarantine EC2 on high-severity GuardDuty/SecHub
+      EventPattern:
+        source: ["aws.guardduty","aws.securityhub"]
+        detail-type: ["GuardDuty Finding","Security Hub Findings - Imported"]
+      Targets:
+        - Arn: !GetAtt QuarantineFn.Arn
+          Id: quarantine
+  QuarantinePerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QuarantineFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt QuarantineRule.Arn
+
+Conditions:
+  MakeApp: !Equals [ !Ref CreateDemoApp, 'true' ]
+  UseMacie: !Equals [ !Ref EnableMacie, 'true' ]
+
+Outputs:
+  ALBURL:
+    Condition: MakeApp
+    Value: !Sub http://${ALB.DNSName}
+    Description: Demo app URL
